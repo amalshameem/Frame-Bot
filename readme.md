@@ -2,14 +2,17 @@
 
 ## Introduction
 
-Just a simple discord bot that puts a frame (transparent and png format) on images 
+A simple discord bot that puts a frame on images 
 
 ## Requirements
 
-- Access to Discord Developer Portal
-- Bot token
+- Access to Discord Developer Portal, Bot token
+- Python 3.14+
 
 ## Installation
 
-- Create an additional file called config.py and put your bot token there ex; TOKEN = 'mklusbdoluyue.hdwudpedqiwhdyhwdppq'
+- Create an additional file called config.py and put your bot token there
+- Install all the requirements
+- 
+
 
