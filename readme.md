@@ -51,5 +51,10 @@ The program uses AI capabilities to detect the subject and image processing to d
 - /setchannel - Set the channel for framing.
 - /uploadframe - Upload the transparent PNG frame.
 
+# LICENSE
+
+This project is licensed under the [GNU Affero General Public License v3.0](LICENSE)
+
+
 
 
