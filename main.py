@@ -49,12 +49,14 @@ settings = load_settings()
 # --- AI & IMAGE PROCESSING ENGINE ---
 class ImageEngine:
     state = {}
+    user_adjustments = {}
+    user_selected_frame = {}
 
     @staticmethod
-    def get_paths(guild_id):
+    def get_paths(guild_id, slot):
         return (
-            os.path.join(FRAMES_DIR, f"{guild_id}_frame.png"),
-            os.path.join(FRAMES_DIR, f"{guild_id}_mask.png")
+            os.path.join(FRAMES_DIR, f"{guild_id}_frame_{slot}.png"),
+            os.path.join(FRAMES_DIR, f"{guild_id}_mask_{slot}.png")
         )
 
     @staticmethod
@@ -70,8 +72,8 @@ class ImageEngine:
             del ImageEngine.state[guild_id]
 
     @staticmethod
-    def analyze_frame_and_save(guild_id):
-        frame_path, mask_path = ImageEngine.get_paths(guild_id)
+    def analyze_frame_and_save(guild_id, slot):
+        frame_path, mask_path = ImageEngine.get_paths(guild_id, slot)
         if not os.path.exists(frame_path): return None
 
         # 1. Load Frame
@@ -132,7 +134,10 @@ class ImageEngine:
         mask_pil = Image.fromarray(final_mask)
         mask_pil.save(mask_path)
 
-        ImageEngine.state[guild_id] = {
+        if guild_id not in ImageEngine.state:
+            ImageEngine.state[guild_id] = {}
+            
+        ImageEngine.state[guild_id][str(slot)] = {
             "current_frame": frame_pil,
             "current_mask": mask_pil,
             "frame_hole_bbox": bbox
@@ -202,6 +207,7 @@ class ImageEngine:
             center_y = int((min_y + max_y) / 2)
         
         return center_x, center_y
+
         
     @staticmethod
     def smart_crop(user_img_pil, target_w, target_h):
@@ -241,31 +247,223 @@ class ImageEngine:
         if left + target_w > new_w: left = new_w - target_w
         if top + target_h > new_h: top = new_h - target_h
 
-        return resized_img.crop((left, top, left + target_w, top + target_h))
+        return resized_img.crop((left, top, left + target_w, top + target_h)) 
+    
 
     @staticmethod
-    def process_final_image(user_img_bytes, guild_id):
-        if guild_id not in ImageEngine.state:
-            frame_path, mask_path = ImageEngine.get_paths(guild_id)
-            if os.path.exists(frame_path) and os.path.exists(mask_path):
-                 ImageEngine.analyze_frame_and_save(guild_id)
-            else:
-                return None
+    def process_final_image(user_img_bytes, guild_id, slot, x_off=0, y_off=0, zoom=1.0):
+        slot = str(slot)
+        if guild_id not in ImageEngine.state or slot not in ImageEngine.state[guild_id]:
+            ImageEngine.analyze_frame_and_save(guild_id, slot)
 
-        guild_data = ImageEngine.state[guild_id]
-        
+        guild_data = ImageEngine.state[guild_id][slot]
         user_img = Image.open(io.BytesIO(user_img_bytes)).convert("RGBA")
         frame_img = guild_data["current_frame"]
-        mask_img = guild_data["current_mask"] 
+        mask_img = guild_data["current_mask"]
         hx, hy, hw, hh = guild_data["frame_hole_bbox"]
         
-        cropped_user = ImageEngine.smart_crop(user_img, hw, hh)
+        # 1. Canvas Dimensions
+        canvas_w, canvas_h = frame_img.size
         
-        content_layer = Image.new("RGBA", frame_img.size, (0, 0, 0, 0))
-        content_layer.paste(cropped_user, (hx, hy))
-        masked_content = Image.composite(content_layer, Image.new("RGBA", frame_img.size, (0,0,0,0)), mask_img)
-        masked_content.alpha_composite(frame_img)
-        return masked_content
+        # 2. Use AI to find the subject center (Smart Crop Logic)
+        # Instead of cropping, we use these coordinates to "aim" the image
+        cx, cy = ImageEngine.detect_subject_center(user_img)
+        
+        # 3. Scale User Image to fit the hole height/width initially
+        img_w, img_h = user_img.size
+        ratio = max(hw / img_w, hh / img_h) # Use max to ensure the hole is filled
+        
+        new_w = int(img_w * ratio * zoom)
+        new_h = int(img_h * ratio * zoom)
+        resized_user = user_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        
+        # 4. Calculate Smart Center
+        # We map the AI detected center to the new resized dimensions
+        scale_x, scale_y = new_w / img_w, new_h / img_h
+        smart_cx, smart_cy = int(cx * scale_x), int(cy * scale_y)
+        
+        # Determine the top-left coordinate to place the image so that 
+        # the 'smart center' is in the middle of the frame hole
+        hole_center_x = hx + (hw // 2)
+        hole_center_y = hy + (hh // 2)
+        
+        start_x = hole_center_x - smart_cx
+        start_y = hole_center_y - smart_cy
+        
+        # 5. Create Background Layer
+        background = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+        # Paste with Smart Start + User Manual Adjustments
+        background.paste(resized_user, (start_x + x_off, start_y + y_off))
+        
+        # 6. Apply Mask and Frame Overlay
+        final_composite = Image.composite(background, Image.new("RGBA", (canvas_w, canvas_h), (0,0,0,0)), mask_img)
+        final_composite.alpha_composite(frame_img)
+        
+        return final_composite
+    
+    @staticmethod
+    def generate_preview(guild_id):
+        frames = []
+        for slot in range(1, 6):
+            frame_path, _ = ImageEngine.get_paths(guild_id, slot)
+            if os.path.exists(frame_path):
+                # Load frame and add a label/border so users know which is which
+                img = Image.open(frame_path).convert("RGBA")
+                # Resize for preview (e.g., max 300px height)
+                img.thumbnail((300, 300))
+                frames.append((slot, img))
+        
+        if not frames:
+            return None
+
+        # Create a canvas to hold all frames side-by-side
+        total_width = sum(f[1].width for f in frames) + (len(frames) * 10)
+        max_height = max(f[1].height for f in frames) + 40 # Space for slot labels
+        
+        preview_canvas = Image.new("RGBA", (total_width, max_height), (0, 0, 0, 0))
+        
+        current_x = 0
+        for slot, img in frames:
+            # Paste frame
+            preview_canvas.paste(img, (current_x, 40), img)
+            # (Optional) You could use ImageDraw here to text labels "Slot 1", etc.
+            current_x += img.width + 10
+            
+        return preview_canvas
+
+class OpenEditorView(discord.ui.View):
+    def __init__(self, user_img_url, guild_id, slot, user_id):
+        super().__init__(timeout=300)
+        self.user_img_url = user_img_url
+        self.guild_id = guild_id
+        self.slot = slot
+        self.user_id = user_id
+
+    @discord.ui.button(label="🎨 Open Private Editor", style=discord.ButtonStyle.success)
+    async def open_editor(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # This starts the ephemeral (private) adjustment session
+        view = AdjustView(self.user_img_url, self.guild_id, self.slot, self.user_id)
+        await view.update_image(interaction)
+        # Delete the trigger message to keep channel clean
+        await interaction.message.delete()
+
+class AdjustView(discord.ui.View):
+    def __init__(self, user_img_url, guild_id, slot, user_id):
+        # We set the timeout to 600 seconds (10 minutes)
+        super().__init__(timeout=600) 
+        self.user_img_url = user_img_url
+        self.guild_id = guild_id
+        self.slot = slot
+        self.user_id = user_id
+        
+        if user_id not in ImageEngine.user_adjustments:
+            ImageEngine.user_adjustments[user_id] = {"x": 0, "y": 0, "zoom": 1.0}
+
+    async def on_timeout(self):
+        """Automatically called when the user stops interacting for 10 minutes"""
+        if self.user_id in ImageEngine.user_adjustments:
+            del ImageEngine.user_adjustments[self.user_id]
+        
+        # Optional: Log the timeout for debugging
+        print(f"⏱️ Session for User {self.user_id} timed out and was cleared.")
+
+    async def update_image(self, interaction: discord.Interaction):
+        # Every time the user clicks a button, the 10-minute timer resets automatically.
+        adj = ImageEngine.user_adjustments[self.user_id]
+        async with aiohttp.ClientSession() as session:
+            async with session.get(self.user_img_url) as resp:
+                data = await resp.read()
+                final = await bot.loop.run_in_executor(
+                    None, ImageEngine.process_final_image, data, self.guild_id, self.slot, adj["x"], adj["y"], adj["zoom"]
+                )
+                
+                with io.BytesIO() as out:
+                    final.save(out, 'PNG')
+                    out.seek(0)
+                    file = discord.File(fp=out, filename="adjust.png")
+                    
+                    if interaction.response.is_done():
+                        await interaction.edit_original_response(
+                            content=f"🛠️ **Editor (Slot {self.slot}):**\n*This session will expire in 10 mins of inactivity.*",
+                            attachments=[file], 
+                            view=self
+                        )
+                    else:
+                        await interaction.response.send_message(
+                            content=f"🛠️ **Editor (Slot {self.slot}):**", 
+                            file=file, view=self, ephemeral=True
+                        )
+
+    # ... (Keep your existing buttons: Up, Down, Zoom, Finish) ...
+
+    @discord.ui.button(label="➕ Zoom", style=discord.ButtonStyle.success, row=0)
+    async def zoom_in(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        ImageEngine.user_adjustments[self.user_id]["zoom"] += 0.25
+        await self.update_image(interaction)
+
+    @discord.ui.button(label="⬆️ Up", style=discord.ButtonStyle.secondary, row=0)
+    async def up(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        ImageEngine.user_adjustments[self.user_id]["y"] -= 40
+        await self.update_image(interaction)
+
+    @discord.ui.button(label="➖ Zoom", style=discord.ButtonStyle.danger, row=0)
+    async def zoom_out(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        ImageEngine.user_adjustments[self.user_id]["zoom"] = max(0.5, ImageEngine.user_adjustments[self.user_id]["zoom"] - 0.1)
+        await self.update_image(interaction)
+
+    @discord.ui.button(label="⬅️ Left", style=discord.ButtonStyle.secondary, row=1)
+    async def left(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        ImageEngine.user_adjustments[self.user_id]["x"] -= 40
+        await self.update_image(interaction)
+
+    @discord.ui.button(label="⬇️ Down", style=discord.ButtonStyle.secondary, row=1)
+    async def down(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        ImageEngine.user_adjustments[self.user_id]["y"] += 40
+        await self.update_image(interaction)
+
+    @discord.ui.button(label="➡️ Right", style=discord.ButtonStyle.secondary, row=1)
+    async def right(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        ImageEngine.user_adjustments[self.user_id]["x"] += 40
+        await self.update_image(interaction)
+    
+    @discord.ui.button(label="✅ Finish", style=discord.ButtonStyle.primary, row=2)
+    async def finish(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 1. Inform the user the process is complete
+        await interaction.response.edit_message(content="✨ **Saving...**", view=None, attachments=[])
+        
+        # 2. Generate the final image one last time
+        adj = ImageEngine.user_adjustments[self.user_id]
+        async with aiohttp.ClientSession() as session:
+            async with session.get(self.user_img_url) as resp:
+                data = await resp.read()
+                final = await bot.loop.run_in_executor(
+                    None, ImageEngine.process_final_image, data, self.guild_id, self.slot, adj["x"], adj["y"], adj["zoom"]
+                )
+                
+                with io.BytesIO() as out:
+                    final.save(out, 'PNG')
+                    out.seek(0)
+                    file = discord.File(fp=out, filename="final_framed.png")
+                    
+                    # 3. Send to the public channel (NOT ephemeral)
+                    target_channel_id = settings[self.guild_id].get("target_channel_id")
+                    channel = bot.get_channel(target_channel_id)
+                    
+                    if channel:
+                        await channel.send(
+                            content=f"🎨 **New Image Created by {interaction.user.mention}**",
+                            file=file
+                        )
+
+        # 4. Clean up memory
+        if self.user_id in ImageEngine.user_adjustments:
+            del ImageEngine.user_adjustments[self.user_id]
 
 # --- BOT SETUP ---
 class FrameBot(commands.Bot):
@@ -327,9 +525,10 @@ async def setchannel_error(interaction: discord.Interaction, error: app_commands
     else:
         await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
 
-@bot.tree.command(name="uploadframe", description="Admin: Upload the transparent PNG frame")
+@bot.tree.command(name="uploadframe", description="Admin: Upload a frame to a specific slot")
 @app_commands.checks.has_permissions(administrator=True)
-async def uploadframe(interaction: discord.Interaction, attachment: discord.Attachment):
+@app_commands.describe(slot="Choose a slot (1-5)")
+async def uploadframe(interaction: discord.Interaction, attachment: discord.Attachment, slot: app_commands.Range[int, 1, 5]):
     if not attachment.filename.lower().endswith(".png"):
         return await interaction.response.send_message("❌ Error: Frame must be a PNG.", ephemeral=True)
     
@@ -337,55 +536,120 @@ async def uploadframe(interaction: discord.Interaction, attachment: discord.Atta
     guild_id = str(interaction.guild_id)
 
     try:
-        ImageEngine.cleanup_old_files(guild_id)
-        
-        frame_path, _ = ImageEngine.get_paths(guild_id)
+        frame_path, _ = ImageEngine.get_paths(guild_id, slot)
         await attachment.save(frame_path)
         
-        bbox = ImageEngine.analyze_frame_and_save(guild_id)
+        ImageEngine.analyze_frame_and_save(guild_id, slot)
         
-        await interaction.followup.send(f"🖼️ New frame uploaded!")
+        await interaction.followup.send(f"✅ Frame slot **{slot}** updated!")
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {e}")
 
+@bot.tree.command(name="removeframe", description="Admin: Delete a frame from a specific slot")
+@app_commands.checks.has_permissions(administrator=True)
+async def removeframe(interaction: discord.Interaction, slot: app_commands.Range[int, 1, 5]):
+    await interaction.response.defer(ephemeral=True)
+    guild_id = str(interaction.guild_id)
+    
+    frame_path, mask_path = ImageEngine.get_paths(guild_id, slot)
+    if os.path.exists(frame_path):
+        os.remove(frame_path)
+        if os.path.exists(mask_path): os.remove(mask_path)
+        
+        # Clear from memory so it's gone from the preview
+        if guild_id in ImageEngine.state and str(slot) in ImageEngine.state[guild_id]:
+            del ImageEngine.state[guild_id][str(slot)]
+            
+        await interaction.followup.send(f"🗑️ Slot {slot} removed.")
+    else:
+        await interaction.followup.send("⚠️ That slot is already empty.")
+
+@bot.tree.command(name="frames", description="Show available frames to choose from")
+async def show_frames(interaction: discord.Interaction):
+    guild_id = str(interaction.guild_id)
+    preview_img = await bot.loop.run_in_executor(None, ImageEngine.generate_preview, guild_id) #
+    
+    if not preview_img:
+        return await interaction.response.send_message("❌ No frames available yet!", ephemeral=True) #
+
+    with io.BytesIO() as bio:
+        preview_img.save(bio, 'PNG')
+        bio.seek(0)
+        view = FramePicker(None, guild_id) # URL is None because they haven't uploaded yet
+        await interaction.response.send_message(
+            content="🎨 **Choose a frame to start:**",
+            file=discord.File(bio, "preview.png"),
+            view=view
+        ) #
+
+@bot.tree.command(name="useframe", description="Upload your photo to a specific frame slot")
+@app_commands.describe(slot="Choose a slot (1-5)", image="The photo you want to frame")
+async def useframe(interaction: discord.Interaction, slot: app_commands.Range[int, 1, 5], image: discord.Attachment):
+    # Defer ephemerally so ONLY the user sees the loading state
+    await interaction.response.defer(ephemeral=True)
+    
+    if not image.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
+        return await interaction.followup.send("❌ Please upload a valid image file.")
+
+    guild_id = str(interaction.guild_id)
+    user_id = interaction.user.id
+
+    # Check if the frame exists
+    frame_path, _ = ImageEngine.get_paths(guild_id, slot)
+    if not os.path.exists(frame_path):
+        return await interaction.followup.send(f"❌ Slot {slot} has no frame uploaded by an admin.")
+
+    # Initialize the editor view immediately
+    view = AdjustView(image.url, guild_id, slot, user_id)
+    
+    # Process the initial image and send it as an ephemeral followup
+    # This automatically "opens" the editor for the user
+    await view.update_image(interaction)
+
 # --- MESSAGE LISTENER ---
+class FramePicker(discord.ui.View):
+    def __init__(self, user_img_url, guild_id):
+        super().__init__(timeout=300)
+        self.user_img_url = user_img_url
+        self.guild_id = str(guild_id)
+        
+        # Dynamically create buttons for slots that actually have frames
+        for slot in range(1, 6):
+            frame_path, _ = ImageEngine.get_paths(self.guild_id, slot)
+            if os.path.exists(frame_path):
+                btn = discord.ui.Button(label=f"Frame {slot}", custom_id=str(slot), style=discord.ButtonStyle.primary)
+                btn.callback = self.button_callback
+                self.add_item(btn)
+
+    async def on_timeout(self):
+        # If the user doesn't pick a frame, we don't need to do much,
+        # but you could clear their selection if you were tracking it here.
+        pass
+
+    async def button_callback(self, interaction: discord.Interaction):
+        slot = interaction.data['custom_id']
+        # Guide the user to the ephemeral command
+        await interaction.response.send_message(
+            content=f"✅ **Frame {slot} selected!**\n Use the command: `/useframe slot:{slot}` and attach your photo.",
+            ephemeral=True
+        )
+
 @bot.event
 async def on_message(message):
-    if message.author.bot: return
-    
-    guild_id = str(message.guild.id)
-    if guild_id not in settings: return
-    
-    target_channel = settings[guild_id].get("target_channel_id")
-    if message.channel.id != target_channel: return
-    
-    if not message.attachments: return
+    if message.author.bot or not message.attachments: return
 
-    frame_path, _ = ImageEngine.get_paths(guild_id)
-    if not os.path.exists(frame_path): return
+    user_id = message.author.id
+    if user_id not in ImageEngine.user_selected_frame: return
 
+    slot = ImageEngine.user_selected_frame[user_id]
     att = message.attachments[0]
+
     if att.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-        loading_msg = await message.channel.send("🎨 composing...")
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(att.url) as resp:
-                    user_img_data = await resp.read()
-                    
-                    final_result = await bot.loop.run_in_executor(None, ImageEngine.process_final_image, user_img_data, guild_id)
-                    
-                    if final_result:
-                        with io.BytesIO() as binary:
-                            final_result.save(binary, 'PNG')
-                            binary.seek(0)
-                            await message.reply(
-                                content=message.author.mention, 
-                                file=discord.File(fp=binary, filename='framed.png')
-                            )
-            await loading_msg.delete()
-        except Exception as e:
-            await message.channel.send(f"❌ Error: {e}")
-            print(f"Error in {message.guild.name}: {e}")
+        # Clear selection so they must pick a frame again for a new photo
+        del ImageEngine.user_selected_frame[user_id]
+
+        view = AdjustView(att.url, str(message.guild.id), slot, user_id)
+        await view.initial_send(message)
 
 if __name__ == "__main__":
     bot.run(config.TOKEN)
