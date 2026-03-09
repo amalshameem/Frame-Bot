@@ -1,8 +1,14 @@
-# Frame Bot
+# Frame Bot V2
 
 ## Introduction
 
 A Discord bot that adds a frame to images.
+
+## New features
+
+- A basic editor + preview to see all the frames
+- More commands
+- Can upload upto 5 frames
 
 ## Requirements
 
@@ -17,7 +23,7 @@ A Discord bot that adds a frame to images.
 
 ## Usage
 
-The bot is built with an autoframing mechanism which uses YOLO model to detect subjects. For now it mostly works on humans and animals. The program is sensitive to aspect ratio of images. It works best with 1:1 images. Frames should be of PNG format and transparent on where the image needs to go. They should also be closed frames.
+The bot is built with an autoframing mechanism which uses YOLO model to detect subjects. Frames should be of PNG format and transparent on where the image needs to go. They should also be closed frames.
 
 ### Usage of AI and Image processing
 
@@ -40,20 +46,32 @@ The program uses AI capabilities to detect the subject and image processing to d
 
 ### Usage in Discord
 
-- Only users with administrator access can interact with the bot's commands.
+#### Admin
+
+- Only users with administrator access can setup the bot.
 - Add the bot to your server.
 - Create a channel for the bot, and set the channel.
-- An admin can then upload the frame.
-- When a user sends an image in that channel (one at a time), their image will be automatically framed.
+- An admin can then upload or remove the frame(upto 5 frames).
+
+#### User
+
+- Can see all the available frames using /frames
+- By using the command /useframe, an user can select the frame and upload the image.
+- An editor opens up, by default it frames using AI. However if the user want manual controls they can do such here.
+- Once finished, the final image will be sent in the channel.
 
 ### Commands
 
-- /setchannel - Set the channel for framing.
-- /uploadframe - Upload the transparent PNG frame.
+- /setchannel (only admin)- Set the channel for framing.
+- /uploadframe (only admin)- Upload the transparent PNG frame.
+- /frames - Show available frames to choose from.
+- /useframe - Upload your image to a specific frame slot.
+- /removeframe (only admin)- Delete a frame from a specific slot
 
 # LICENSE
 
 This project is licensed under the [GNU Affero General Public License v3.0](LICENSE)
+
 
 
 
