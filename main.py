@@ -10,6 +10,9 @@ import os
 import json
 from typing import Union
 from ultralytics import YOLO
+import torch
+from torchvision import transforms
+from transformers import AutoModelForImageSegmentation
 
 # --- CONFIGURATION ---
 try:
@@ -24,11 +27,33 @@ FRAMES_DIR = "frames"
 if not os.path.exists(FRAMES_DIR):
     os.makedirs(FRAMES_DIR)
 
-# --- LOAD AI MODEL ---
+# --- LOAD AI MODELS ---
 
-print("⏳ Loading AI Model... (This might take a moment on first run)")
+print("⏳ Loading YOLO Model...")
 model = YOLO("yolo11s.pt") 
-print("✅ AI Model Loaded.")
+print("✅ YOLO Model Loaded.")
+
+def load_birefnet_model():
+    print("⏳ Loading BiRefNet Model (ZhengPeng7/BiRefNet)...")
+    model_bi = AutoModelForImageSegmentation.from_pretrained('ZhengPeng7/BiRefNet', trust_remote_code=True)
+    
+    # Identify device: CUDA > MPS > CPU
+    if torch.cuda.is_available():
+        device = 'cuda'
+    elif torch.backends.mps.is_available():
+        device = 'mps'
+    else:
+        device = 'cpu'
+        
+    model_bi.to(device)
+    if device == 'cpu':
+        model_bi.float() # Ensure float32 on CPU to avoid Half/float mismatch
+        
+    model_bi.eval()
+    print(f"✅ BiRefNet Loaded on {device}.")
+    return model_bi, device
+
+birefnet_model, birefnet_device = load_birefnet_model()
 
 # --- PERSISTENCE ---
 def load_settings():
@@ -251,13 +276,38 @@ class ImageEngine:
     
 
     @staticmethod
-    def process_final_image(user_img_bytes, guild_id, slot, x_off=0, y_off=0, zoom=1.0):
+    def remove_bg(image):
+        img_rgb = image.convert('RGB')
+        original_size = img_rgb.size
+        
+        transform_image = transforms.Compose([
+            transforms.Resize((1024, 1024)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+        
+        # Get dtype from model
+        dtype = next(birefnet_model.parameters()).dtype
+        input_tensor = transform_image(img_rgb).unsqueeze(0).to(birefnet_device).to(dtype)
+        
+        with torch.no_grad():
+            preds = birefnet_model(input_tensor)[-1].sigmoid().cpu()
+        
+        mask = preds[0].squeeze()
+        mask_pil = transforms.ToPILImage()(mask).resize(original_size)
+        
+        birefnet_result = img_rgb.copy()
+        birefnet_result.putalpha(mask_pil)
+        return birefnet_result
+
+    @staticmethod
+    def process_final_image(user_img, guild_id, slot, x_off=0, y_off=0, zoom=1.0):
         slot = str(slot)
         if guild_id not in ImageEngine.state or slot not in ImageEngine.state[guild_id]:
             ImageEngine.analyze_frame_and_save(guild_id, slot)
 
         guild_data = ImageEngine.state[guild_id][slot]
-        user_img = Image.open(io.BytesIO(user_img_bytes)).convert("RGBA")
+        # user_img is now expected to be a PIL Image (RGBA)
         frame_img = guild_data["current_frame"]
         mask_img = guild_data["current_mask"]
         hx, hy, hw, hh = guild_data["frame_hole_bbox"]
@@ -355,6 +405,9 @@ class AdjustView(discord.ui.View):
         self.guild_id = guild_id
         self.slot = slot
         self.user_id = user_id
+        self.original_img = None
+        self.bg_removed_img = None
+        self.is_bg_removed = False
         
         if user_id not in ImageEngine.user_adjustments:
             ImageEngine.user_adjustments[user_id] = {"x": 0, "y": 0, "zoom": 1.0}
@@ -367,99 +420,142 @@ class AdjustView(discord.ui.View):
         # Optional: Log the timeout for debugging
         print(f"⏱️ Session for User {self.user_id} timed out and was cleared.")
 
+    async def load_image(self):
+        if self.original_img is None:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self.user_img_url) as resp:
+                    data = await resp.read()
+                    self.original_img = Image.open(io.BytesIO(data)).convert("RGBA")
+
     async def update_image(self, interaction: discord.Interaction):
+        await self.load_image()
+        
         # Every time the user clicks a button, the 10-minute timer resets automatically.
         adj = ImageEngine.user_adjustments[self.user_id]
-        async with aiohttp.ClientSession() as session:
-            async with session.get(self.user_img_url) as resp:
-                data = await resp.read()
-                final = await bot.loop.run_in_executor(
-                    None, ImageEngine.process_final_image, data, self.guild_id, self.slot, adj["x"], adj["y"], adj["zoom"]
+        
+        current_img = self.bg_removed_img if self.is_bg_removed else self.original_img
+        
+        final = await bot.loop.run_in_executor(
+            None, ImageEngine.process_final_image, current_img, self.guild_id, self.slot, adj["x"], adj["y"], adj["zoom"]
+        )
+        
+        with io.BytesIO() as out:
+            final.save(out, 'PNG')
+            out.seek(0)
+            file = discord.File(fp=out, filename="adjust.png")
+            
+            if interaction.response.is_done():
+                await interaction.edit_original_response(
+                    content=f"🛠️ **Editor (Slot {self.slot}):**\n*This session will expire in 10 mins of inactivity.*",
+                    attachments=[file], 
+                    view=self
                 )
-                
-                with io.BytesIO() as out:
-                    final.save(out, 'PNG')
-                    out.seek(0)
-                    file = discord.File(fp=out, filename="adjust.png")
-                    
-                    if interaction.response.is_done():
-                        await interaction.edit_original_response(
-                            content=f"🛠️ **Editor (Slot {self.slot}):**\n*This session will expire in 10 mins of inactivity.*",
-                            attachments=[file], 
-                            view=self
-                        )
-                    else:
-                        await interaction.response.send_message(
-                            content=f"🛠️ **Editor (Slot {self.slot}):**", 
-                            file=file, view=self, ephemeral=True
-                        )
+            else:
+                await interaction.response.send_message(
+                    content=f"🛠️ **Editor (Slot {self.slot}):**", 
+                    file=file, view=self, ephemeral=True
+                )
 
-    # ... (Keep your existing buttons: Up, Down, Zoom, Finish) ...
+    async def initial_send(self, message: discord.Message):
+        await self.load_image()
+        adj = ImageEngine.user_adjustments[self.user_id]
+        current_img = self.bg_removed_img if self.is_bg_removed else self.original_img
+        
+        final = await bot.loop.run_in_executor(
+            None, ImageEngine.process_final_image, current_img, self.guild_id, self.slot, adj["x"], adj["y"], adj["zoom"]
+        )
+        
+        with io.BytesIO() as out:
+            final.save(out, 'PNG')
+            out.seek(0)
+            file = discord.File(fp=out, filename="adjust.png")
+            await message.channel.send(
+                content=f"🛠️ **Editor (Slot {self.slot}):**", 
+                file=file, view=self
+            )
 
-    @discord.ui.button(label="➕ Zoom", style=discord.ButtonStyle.success, row=0)
+    @discord.ui.button(label="✂️ Remove BG", style=discord.ButtonStyle.primary, row=0)
+    async def remove_bg_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        if self.bg_removed_img is None:
+            await self.load_image()
+            self.bg_removed_img = await bot.loop.run_in_executor(
+                None, ImageEngine.remove_bg, self.original_img
+            )
+        self.is_bg_removed = True
+        await self.update_image(interaction)
+
+    @discord.ui.button(label="🔄 Restore BG", style=discord.ButtonStyle.secondary, row=0)
+    async def restore_bg_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        self.is_bg_removed = False
+        await self.update_image(interaction)
+
+    @discord.ui.button(label="➕ Zoom", style=discord.ButtonStyle.success, row=1)
     async def zoom_in(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         ImageEngine.user_adjustments[self.user_id]["zoom"] += 0.25
         await self.update_image(interaction)
 
-    @discord.ui.button(label="⬆️ Up", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="⬆️ Up", style=discord.ButtonStyle.secondary, row=1)
     async def up(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         ImageEngine.user_adjustments[self.user_id]["y"] -= 40
         await self.update_image(interaction)
 
-    @discord.ui.button(label="➖ Zoom", style=discord.ButtonStyle.danger, row=0)
+    @discord.ui.button(label="➖ Zoom", style=discord.ButtonStyle.danger, row=1)
     async def zoom_out(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         ImageEngine.user_adjustments[self.user_id]["zoom"] = max(0.5, ImageEngine.user_adjustments[self.user_id]["zoom"] - 0.1)
         await self.update_image(interaction)
 
-    @discord.ui.button(label="⬅️ Left", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="⬅️ Left", style=discord.ButtonStyle.secondary, row=2)
     async def left(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         ImageEngine.user_adjustments[self.user_id]["x"] -= 40
         await self.update_image(interaction)
 
-    @discord.ui.button(label="⬇️ Down", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="⬇️ Down", style=discord.ButtonStyle.secondary, row=2)
     async def down(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         ImageEngine.user_adjustments[self.user_id]["y"] += 40
         await self.update_image(interaction)
 
-    @discord.ui.button(label="➡️ Right", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="➡️ Right", style=discord.ButtonStyle.secondary, row=2)
     async def right(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         ImageEngine.user_adjustments[self.user_id]["x"] += 40
         await self.update_image(interaction)
     
-    @discord.ui.button(label="✅ Finish", style=discord.ButtonStyle.primary, row=2)
+    @discord.ui.button(label="✅ Finish", style=discord.ButtonStyle.primary, row=3)
     async def finish(self, interaction: discord.Interaction, button: discord.ui.Button):
         # 1. Inform the user the process is complete
         await interaction.response.edit_message(content="✨ **Saving...**", view=None, attachments=[])
         
         # 2. Generate the final image one last time
         adj = ImageEngine.user_adjustments[self.user_id]
-        async with aiohttp.ClientSession() as session:
-            async with session.get(self.user_img_url) as resp:
-                data = await resp.read()
-                final = await bot.loop.run_in_executor(
-                    None, ImageEngine.process_final_image, data, self.guild_id, self.slot, adj["x"], adj["y"], adj["zoom"]
+        
+        await self.load_image()
+        current_img = self.bg_removed_img if self.is_bg_removed else self.original_img
+        
+        final = await bot.loop.run_in_executor(
+            None, ImageEngine.process_final_image, current_img, self.guild_id, self.slot, adj["x"], adj["y"], adj["zoom"]
+        )
+        
+        with io.BytesIO() as out:
+            final.save(out, 'PNG')
+            out.seek(0)
+            file = discord.File(fp=out, filename="final_framed.png")
+            
+            # 3. Send to the public channel (NOT ephemeral)
+            target_channel_id = settings[self.guild_id].get("target_channel_id")
+            channel = bot.get_channel(target_channel_id)
+            
+            if channel:
+                await channel.send(
+                    content=f"🎨 **New Image Created by {interaction.user.mention}**",
+                    file=file
                 )
-                
-                with io.BytesIO() as out:
-                    final.save(out, 'PNG')
-                    out.seek(0)
-                    file = discord.File(fp=out, filename="final_framed.png")
-                    
-                    # 3. Send to the public channel (NOT ephemeral)
-                    target_channel_id = settings[self.guild_id].get("target_channel_id")
-                    channel = bot.get_channel(target_channel_id)
-                    
-                    if channel:
-                        await channel.send(
-                            content=f"🎨 **New Image Created by {interaction.user.mention}**",
-                            file=file
-                        )
 
         # 4. Clean up memory
         if self.user_id in ImageEngine.user_adjustments:
@@ -476,6 +572,15 @@ class FrameBot(commands.Bot):
         await self.tree.sync()
 
 bot = FrameBot()
+
+@bot.event
+async def on_connect():
+    print(f"📡 Bot connected to Discord (Latency: {round(bot.latency * 1000)}ms).")
+
+@bot.event
+async def on_ready():
+    print(f"✅ Bot is ONLINE as {bot.user} (ID: {bot.user.id})")
+    print(f"🔗 Guilds: {len(bot.guilds)}")
 
 # --- EVENTS (CLEANUP) ---
 @bot.event
@@ -652,4 +757,5 @@ async def on_message(message):
         await view.initial_send(message)
 
 if __name__ == "__main__":
+    print("🚀 Starting bot...")
     bot.run(config.TOKEN)

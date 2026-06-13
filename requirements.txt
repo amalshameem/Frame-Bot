@@ -59,6 +59,10 @@ sympy==1.14.0
 tifffile==2024.8.30
 torch==2.8.0
 torchvision==0.23.0
+transformers
+einops
+timm
+kornia
 tqdm==4.67.1
 typing_extensions==4.15.0
 ultralytics==8.4.6
