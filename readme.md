@@ -1,6 +1,6 @@
 
 
-# Frame Bot V2
+# Frame Bot
 
 ## Introduction
 
